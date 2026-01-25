@@ -1,0 +1,243 @@
+import requests
+import time
+import smtplib
+import json
+from pathlib import Path
+from email.mime.text import MIMEText
+from email.mime.multipart import MIMEMultipart
+
+# --- Load config ---
+CONFIG_PATH = Path(__file__).resolve().parent / "config.json"
+with open(CONFIG_PATH, "r") as f:
+    config = json.load(f)
+
+ME_API_KEY = config["ME_API_KEY"]
+BIS_API_KEY = config["BIS_API_KEY"]
+
+FLOOR_CHANGE_THRESHOLD = int(config.get("FLOOR_CHANGE_THRESHOLD", 10))
+LISTING_DELTA_THRESHOLD = int(config.get("LISTING_DELTA_THRESHOLD", 15))
+CHECK_INTERVAL = int(config.get("CHECK_INTERVAL", 300))  # seconds
+
+BIS_MAX_REQUESTS_PER_MIN = int(config.get("BIS_MAX_REQUESTS_PER_MIN", 100))
+BIS_MAX_REQUESTS_PER_DAY = int(config.get("BIS_MAX_REQUESTS_PER_DAY", 10000))
+
+SMTP_SERVER = config.get("SMTP_SERVER", "smtp.zoho.eu")
+SMTP_PORT = int(config.get("SMTP_PORT", 587))
+SENDER_EMAIL = config["SENDER_EMAIL"]
+SENDER_PASSWORD = config["SENDER_PASSWORD"]
+RECEIVER_EMAIL = config["RECEIVER_EMAIL"]
+
+COLLECTIONS = [
+    "collection-slug-1",
+    "collection-slug-2",
+    "collection-slug-3",
+    "collection-slug-4",
+    "collection-slug-5"
+]
+
+# --- Rate limiting state ---
+bis_requests_made = 0
+bis_requests_start_time = time.time()
+bis_requests_daily = 0
+bis_requests_day_start = time.time()
+
+# --- State ---
+last_alerted_floor = {}
+last_alerted_listing_ids = {}  # store last alerted listings per collection
+
+# ------------- Helpers -------------
+def safe_get(url, headers=None, params=None):
+    try:
+        response = requests.get(url, headers=headers, params=params, timeout=10)
+        response.raise_for_status()
+        return response.json()
+    except requests.exceptions.HTTPError as e:
+        if response.status_code == 429:
+            print("⚠️ Rate limited! Sleeping 60s...")
+            time.sleep(60)
+        else:
+            print(f"❌ HTTP error: {e}")
+    except requests.exceptions.ConnectionError as e:
+        print(f"❌ Connection error: {e}")
+        time.sleep(15)
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Request failed: {e}")
+    return None
+
+def send_email(subject, body):
+    msg = MIMEMultipart()
+    msg["From"] = SENDER_EMAIL
+    msg["To"] = RECEIVER_EMAIL
+    msg["Subject"] = subject
+    msg.attach(MIMEText(body, "plain"))
+    try:
+        with smtplib.SMTP(SMTP_SERVER, SMTP_PORT) as server:
+            server.starttls()
+            server.login(SENDER_EMAIL, SENDER_PASSWORD)
+            server.send_message(msg)
+            print(f"📧 Email sent: {subject}")
+    except Exception as e:
+        print("❌ Failed to send email:", e)
+
+def bis_rate_limiter():
+    global bis_requests_made, bis_requests_start_time, bis_requests_daily, bis_requests_day_start
+    now = time.time()
+    if now - bis_requests_start_time > 60:
+        bis_requests_start_time = now
+        bis_requests_made = 0
+    if now - bis_requests_day_start > 86400:
+        bis_requests_day_start = now
+        bis_requests_daily = 0
+    if bis_requests_made >= BIS_MAX_REQUESTS_PER_MIN:
+        sleep_time = 60 - (now - bis_requests_start_time)
+        print(f"⏳ BIS rate limit reached, sleeping for {sleep_time:.1f} seconds...")
+        time.sleep(sleep_time)
+        bis_requests_start_time = time.time()
+        bis_requests_made = 0
+    if bis_requests_daily >= BIS_MAX_REQUESTS_PER_DAY:
+        print("⚠️ BIS daily request limit reached! Stopping BIS API calls.")
+        raise Exception("BIS daily limit reached")
+    bis_requests_made += 1
+    bis_requests_daily += 1
+
+# ------------- ME API (floor price) -------------
+def get_floor_price(symbol):
+    url = "https://api-mainnet.magiceden.dev/v2/ord/btc/stat"
+    headers = {"Authorization": f"Bearer {ME_API_KEY}"}
+    params = {"collectionSymbol": symbol}
+    data = safe_get(url, headers=headers, params=params)
+    if not data or "floorPrice" not in data or data["floorPrice"] is None:
+        print(f"⚠️ floorPrice missing for {symbol}: {data}")
+        return None
+    return int(data["floorPrice"]) / 1e8  # satoshis → BTC
+
+# ------------- BTC-USD price -------------
+def get_btc_usd_price():
+    url = "https://api.coingecko.com/api/v3/simple/price"
+    params = {"ids": "bitcoin", "vs_currencies": "usd"}
+    data = safe_get(url, params=params)
+    if data and "bitcoin" in data and "usd" in data["bitcoin"]:
+        return float(data["bitcoin"]["usd"])
+    print("⚠️ Failed to fetch BTC/USD price, USD display disabled.")
+    return None
+
+# ------------- BIS API (listings) -------------
+def get_active_listings_bis(symbol):
+    bis_rate_limiter()
+    url = "https://api.bestinslot.xyz/v3/collection/listings"
+    headers = {"x-api-key": BIS_API_KEY}
+    params = {
+        "slug": symbol,
+        "sort_by": "min_price",
+        "order": "asc",
+        "offset": 0,
+        "count": 20  # ✅ min count required by BIS API
+    }
+    data = safe_get(url, headers=headers, params=params)
+    if data is None:
+        print(f"⚠️ BIS returned no data for {symbol}")
+        return []
+    if "error" in str(data).lower():
+        print(f"❌ BIS error: {data}")
+        return []
+    if isinstance(data, dict) and "data" in data:
+        return data["data"]
+    if isinstance(data, list):
+        return data
+    return []
+
+# ------------- Checkers -------------
+def check_floor_change(symbol, btc_usd_price):
+    current_floor_btc = get_floor_price(symbol)
+    if current_floor_btc is None:
+        return
+    current_floor_usd = current_floor_btc * btc_usd_price if btc_usd_price else None
+    print(f"🟢 {symbol} Floor: {current_floor_btc:.8f} BTC", end="")
+    if current_floor_usd:
+        print(f" (~${current_floor_usd:.2f} USD)")
+    else:
+        print()
+    prev_floor = last_alerted_floor.get(symbol)
+    if prev_floor is None:
+        last_alerted_floor[symbol] = current_floor_btc
+        return
+    change_percent = (current_floor_btc - prev_floor) / prev_floor * 100
+    if abs(change_percent) >= FLOOR_CHANGE_THRESHOLD:
+        subject = f"[Floor Alert] {symbol} Floor Moved {change_percent:.2f}%"
+        body = (
+            f"Previous Alerted Floor: {prev_floor:.8f} BTC\n"
+            f"New Floor: {current_floor_btc:.8f} BTC\n"
+            f"Change: {change_percent:.2f}%\n"
+        )
+        if current_floor_usd:
+            body += f"Approx USD: ${current_floor_usd:.2f}\n"
+        send_email(subject, body)
+        last_alerted_floor[symbol] = current_floor_btc
+
+def check_listing_delta(symbol):
+    listings = get_active_listings_bis(symbol)
+    if not listings or len(listings) < 5:
+        print(f"⚠️ Not enough listings for {symbol} or bad response from BIS.")
+        return
+
+    prices = []
+    listing_ids = []
+
+    try:
+        for listing in listings[:5]:
+            price_sats = listing["magiceden_price"]
+            price_btc = int(price_sats) / 1e8
+            prices.append(price_btc)
+            listing_ids.append(listing.get("inscription_id"))
+    except (KeyError, TypeError, ValueError):
+        print(f"❌ Bad listing data for {symbol}: {listings}")
+        return
+
+    p0 = prices[0]  # cheapest
+    p4 = prices[4]  # 5th cheapest
+
+    # Delta relative to 5th cheapest
+    delta_percent = (p4 - p0) / p4 * 100
+    print(f"🔍 {symbol} Delta Check: {p0:.8f} BTC vs {p4:.8f} BTC ({delta_percent:.2f}% delta)")
+
+    # Only alert if delta >= threshold
+    if delta_percent >= LISTING_DELTA_THRESHOLD:
+        key = symbol
+        if key not in last_alerted_listing_ids:
+            last_alerted_listing_ids[key] = set()
+        # Only alert for new listings
+        if listing_ids[0] and listing_ids[0] not in last_alerted_listing_ids[key]:
+            url = f"https://magiceden.io/ordinals/item-details/{listing_ids[0]}"
+            subject = f"[Snipe Alert] {symbol} Undercut Detected ({delta_percent:.2f}% delta)"
+            body = (
+                f"⚠️ Undercut Listing Detected in {symbol}\n\n"
+                f"Price: {p0:.8f} BTC\n"
+                f"5th Cheapest: {p4:.8f} BTC\n"
+                f"Delta: {delta_percent:.2f}%\n\n"
+                f"Listing ID: {listing_ids[0]}\n"
+                f"Link: {url}"
+            )
+            send_email(subject, body)
+            last_alerted_listing_ids[key].add(listing_ids[0])
+
+
+
+
+# ------------- Main loop -------------
+def main():
+    print("🟢 Starting floor + delta monitor...")
+    btc_usd_price = get_btc_usd_price()
+    while True:
+        for collection in COLLECTIONS:
+            check_floor_change(collection, btc_usd_price)
+            time.sleep(2)
+            try:
+                check_listing_delta(collection)
+            except Exception as e:
+                print(f"❌ BIS API error or rate limit reached: {e}")
+            time.sleep(2)
+        print(f"🕒 Sleeping for {CHECK_INTERVAL // 60} minutes...\n")
+        time.sleep(CHECK_INTERVAL)
+
+if __name__ == "__main__":
+    main()
